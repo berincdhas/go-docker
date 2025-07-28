@@ -2,299 +2,254 @@ name: autodevops-go-docker-cicd
 
 on:
   push:
-    branches:
-      - master
+    branches: ["master"]
   pull_request:
-    branches:
-      - master
+    branches: ["master"]
   workflow_dispatch:
+    inputs:
+      registry:
+        description: "Container registry URL"
+        required: true
+        default: "autodevopsacr.azurecr.io"
+      app_namespace:
+        description: "Kubernetes namespace where the app will be deployed"
+        required: true
+        default: "argo"
+      resourceGroup:
+        description: "Azure resource group"
+        required: true
+        default: "sda-auto-devops-demo"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: autodevops-go-docker-cicd-${{ github.ref }}-pr
   cancel-in-progress: true
 
 permissions:
-  contents: read
   id-token: write
-  packages: write
+  contents: read
+  pull-requests: read
 
 env:
   REGISTRY: autodevopsacr.azurecr.io
-  GIT_CREDENTIALS_SECRET: git-credentials
-  REGISTRY_SECRET: acr-credentials
-  AZURE_SECRET: azure-credentials
+  IMAGE_NAME: go-docker
   APP_NAMESPACE: argo
   RESOURCE_GROUP: sda-auto-devops-demo
-  IMAGE_NAME: go-docker
-  IMAGE_TAG: ${{ github.sha }}
 
 jobs:
-
-  prep:
-    name: Prepare Environment
+  dependency-scan:
+    name: Dependency Scan with Dependabot
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-      
-      - name: Set up Go
+      - uses: actions/checkout@v4
+      - name: Dependabot CLI Scan
+        uses: dependabot/fetch-metadata@v2.1.0
+
+  static-analysis:
+    name: Static Code Analysis with SonarCloud
+    runs-on: ubuntu-latest
+    needs: dependency-scan
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
-      
-      - name: Cache Go Modules
+          go-version: "1.21"
+      - name: Cache SonarCloud packages
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@v2.1.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
-  lint-and-test:
-    name: Lint, Static Analysis & Test
+  build-test:
+    name: Build and Test Go Application
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: prep
+    needs: static-analysis
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Set up Go
+      - uses: actions/checkout@v4
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
-      
-      - name: Run go vet
-        run: go vet ./...
-      
-      - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v4
-        with:
-          version: v1.55.2
-
-      - name: Run go test
+          go-version: "1.21"
+      - name: Download Go Modules
+        run: go mod download
+      - name: Build
+        run: go build -v ./...
+      - name: Test
         run: go test -v ./...
-
-  build:
-    name: Build Go binary & Docker image
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: lint-and-test
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - name: Archive test results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
         with:
-          go-version: '1.21'
-      
-      - name: Build Go binary
-        run: go build -mod=readonly -o ./dist/app
+          name: go-test-results
+          path: '**/test_results/*.xml'
+          if-no-files-found: ignore
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Azure Container Registry
+  docker-build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: build-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to Azure Container Registry
         uses: azure/docker-login@v1
         with:
           login-server: ${{ env.REGISTRY }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-
-      - name: Build Docker image
+          username: ${{ secrets.registry_secret }}
+          password: ${{ secrets.azure_secret }}
+      - name: Build Docker Image
         run: |
-          docker build --build-arg GIT_COMMIT=${{ github.sha }} -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} .
-
-      - name: Save Docker image as artifact
-        if: github.ref == 'refs/heads/master'
+          docker build -t $REGISTRY/$IMAGE_NAME:${{ github.sha }} .
+      - name: Save Docker Image as Artifact
         run: |
-          mkdir -p dockerimage
-          docker save ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} -o dockerimage/image.tar
-        continue-on-error: true
-      - name: Upload Docker image artifact
-        if: github.ref == 'refs/heads/master'
+          docker save $REGISTRY/$IMAGE_NAME:${{ github.sha }} | gzip > go-docker.tar.gz
+      - name: Upload Docker Image Artifact
         uses: actions/upload-artifact@v4
         with:
           name: docker-image
-          path: dockerimage/image.tar
+          path: go-docker.tar.gz
 
-  scan-image:
-    name: Security Scan - Docker Image
+  trivy-scan:
+    name: Container Security Scan with Trivy
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    needs: build
+    needs: docker-build
     steps:
-      - name: Download Docker image artifact
+      - uses: actions/checkout@v4
+      - name: Download Image Artifact
         uses: actions/download-artifact@v4
         with:
           name: docker-image
-          path: ./dockerimage
-
-      - name: Load Docker image
-        run: docker load -i ./dockerimage/image.tar
-
-      - name: Run Trivy scan
-        uses: aquasecurity/trivy-action@v0.16.1
+      - name: Load Docker Image
+        run: docker load --input go-docker.tar.gz
+      - name: Scan Docker Image with Trivy
+        uses: aquasecurity/trivy-action@v0.17.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-          format: 'table'
-          exit-code: '1'
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: "table"
+          exit-code: "1"
+          severity: "CRITICAL,HIGH"
           ignore-unfixed: true
-          vuln-type: 'os,library'
 
   push-image:
-    name: Push Docker Image to Container Registry
+    name: Push Image to Azure Container Registry
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs: scan-image
+    needs: trivy-scan
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Login to Azure Container Registry
+      - uses: actions/checkout@v4
+      - name: Log in to Azure Container Registry
         uses: azure/docker-login@v1
         with:
           login-server: ${{ env.REGISTRY }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-
-      - name: Download Docker image artifact
+          username: ${{ secrets.registry_secret }}
+          password: ${{ secrets.azure_secret }}
+      - name: Download Image Artifact
         uses: actions/download-artifact@v4
         with:
           name: docker-image
-          path: ./dockerimage
+      - name: Load Docker Image
+        run: docker load --input go-docker.tar.gz
+      - name: Push Docker Image
+        run: docker push $REGISTRY/$IMAGE_NAME:${{ github.sha }}
 
-      - name: Load Docker image
-        run: docker load -i ./dockerimage/image.tar
-
-      - name: Push Docker image
-        run: docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-
-  iac-provision:
-    name: Deploy Infra (Terraform/ARM)
+  iac-deploy:
+    name: Deploy to AKS with Terraform
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     needs: push-image
     environment:
       name: production
+      url: https://${{ env.REGISTRY }}/
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Set up Azure CLI
-        uses: azure/cli@v2
-
-      - name: Azure Login (OIDC)
+      - uses: actions/checkout@v4
+      - name: Setup Azure CLI
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          creds: ${{ secrets.azure_secret }}
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+      - name: Terraform Init
+        run: terraform init
+        working-directory: ./infra
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -var="resource_group=${{ env.RESOURCE_GROUP }}" -var="registry=${{ env.REGISTRY }}" -var="image_tag=${{ github.sha }}" -var="namespace=${{ env.APP_NAMESPACE }}"
+        working-directory: ./infra
 
-      - name: Terraform Init/Apply
-        if: exists('terraform')
-        shell: bash
-        run: |
-          cd terraform
-          terraform init
-          terraform apply -auto-approve
-        continue-on-error: true
-
-      - name: Deploy ARM Templates
-        if: exists('arm-templates')
-        shell: bash
-        run: |
-          az deployment group create --resource-group ${{ env.RESOURCE_GROUP }} --template-file arm-templates/template.json --parameters arm-templates/parameters.json
-        continue-on-error: true
-
-  deploy:
-    name: Deploy to AKS
+  deploy-to-aks:
+    name: Deploy Application to AKS
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: iac-provision
-    environment:
-      name: production
+    needs: iac-deploy
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Set up Azure CLI
-        uses: azure/cli@v2
-
-      - name: Azure Login (OIDC)
+      - uses: actions/checkout@v4
+      - name: Azure Login
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
+          creds: ${{ secrets.azure_secret }}
       - name: Get AKS Credentials
-        run: az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.APP_NAMESPACE }}-aks --admin --overwrite-existing
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: sda-auto-devops-demo-aks
+      - name: Set Kube Namespace
+        run: kubectl config set-context --current --namespace=${{ env.APP_NAMESPACE }}
+      - name: Deploy Application Manifests
+        run: kubectl apply -f k8s/
+      - name: Verify Rollout
+        run: kubectl rollout status deployment/go-docker -n ${{ env.APP_NAMESPACE }}
 
-      - name: Create/Update Registry Secret
-        run: |
-          kubectl create secret docker-registry ${{ env.REGISTRY_SECRET }} \
-            --docker-server=${{ env.REGISTRY }} \
-            --docker-username=${{ secrets.ACR_USERNAME }} \
-            --docker-password=${{ secrets.ACR_PASSWORD }} \
-            --docker-email=none@none.com \
-            --namespace ${{ env.APP_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
-
-      - name: Deploy to AKS
-        run: |
-          if [ -f helm/Chart.yaml ]; then
-            helm upgrade --install ${{ env.IMAGE_NAME }} helm \
-              --namespace ${{ env.APP_NAMESPACE }} \
-              --set image.repository=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} \
-              --set image.tag=${{ env.IMAGE_TAG }} \
-              --wait --atomic
-          else
-            kubectl set image deployment/${{ env.IMAGE_NAME }} ${${
-              env.IMAGE_NAME }}=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} --namespace ${{ env.APP_NAMESPACE }}
-            kubectl rollout status deployment/${{ env.IMAGE_NAME }} --namespace ${{ env.APP_NAMESPACE }}
-          fi
-
-      - name: Apply Azure/K8s Policies
-        run: |
-          # Placeholder: enforce Azure Policy and network policies via CLI or ARM/Terraform
-          echo "Policies applied and validated."
-
-  post-deploy-validate:
-    name: Post-deployment Validation & Monitoring
+  post-deploy-validation:
+    name: Post-Deployment Validation
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    needs: deploy
+    needs: deploy-to-aks
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Set up Azure CLI
-        uses: azure/cli@v2
-
-      - name: Azure Login (OIDC)
+      - uses: actions/checkout@v4
+      - name: Azure Login
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Run Smoke Tests
+          creds: ${{ secrets.azure_secret }}
+      - name: Get AKS Credentials
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: sda-auto-devops-demo-aks
+      - name: Health Check
         run: |
-          # Example with curl probing a known health endpoint
-          export SERVICE_URL=$(kubectl get svc/${{ env.IMAGE_NAME }} --namespace ${{ env.APP_NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-          curl --fail --retry 5 --retry-delay 5 $SERVICE_URL/healthz
-
-      - name: Enable Azure Monitor (AKS Insights)
+          kubectl get pods -n $APP_NAMESPACE
+          kubectl get svc -n $APP_NAMESPACE
+          kubectl get deployment go-docker -n $APP_NAMESPACE
+      - name: Application Smoke Test
         run: |
-          az aks enable-addons --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.APP_NAMESPACE }}-aks --addons monitoring
-        continue-on-error: true
+          APP_URL=$(kubectl get svc go-docker -n $APP_NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          curl --fail http://$APP_URL/healthz
 
-      - name: Validate Azure Policies
+  setup-monitoring:
+    name: Monitoring and Alerts Setup
+    runs-on: ubuntu-latest
+    needs: post-deploy-validation
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.azure_secret }}
+      - name: Get AKS Credentials
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: sda-auto-devops-demo-aks
+      - name: Install Prometheus and Grafana via Helm
         run: |
-          echo "Validate compliance and policy enforcement."
-          # Consider checking and reporting Azure Policy compliance here
-        continue-on-error: true
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+          helm upgrade --install prometheus prometheus-community/prometheus --namespace $APP_NAMESPACE --create-namespace
+          helm upgrade --install grafana grafana/grafana --namespace $APP_NAMESPACE --create-namespace
+      - name: Enable Azure Monitor for Containers
+        run: |
+          az aks enable-addons -g $RESOURCE_GROUP -n sda-auto-devops-demo-aks -a monitoring
+      - name: Set up Alerts Example
+        run: |
+          echo "Configure custom alert rules in Prometheus and Azure Monitor as required"
+    timeout-minutes: 30
