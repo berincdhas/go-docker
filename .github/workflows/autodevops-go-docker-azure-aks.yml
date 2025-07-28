@@ -1,0 +1,318 @@
+name: AutodevOps Go Docker Azure AKS
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: 'Container Registry URL'
+        required: true
+        default: autodevopsacr.azurecr.io
+      git_credentials:
+        description: 'Kubernetes secret for git credentials'
+        required: true
+        default: git-credentials
+      registry_secret:
+        description: 'Kubernetes secret for registry credentials'
+        required: true
+        default: acr-credentials
+      azure_secret:
+        description: 'Kubernetes secret for Azure credentials'
+        required: true
+        default: azure-credentials
+      app_namespace:
+        description: 'Kubernetes namespace for deployment'
+        required: true
+        default: argo
+      resourceGroup:
+        description: 'Azure resource group'
+        required: true
+        default: sda-auto-devops-demo
+
+permissions:
+  contents: read
+  id-token: write
+  actions: read
+
+concurrency:
+  group: autodevops-go-docker-azure-aks-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ${{ github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}
+  GIT_CREDENTIALS_SECRET: ${{ github.event.inputs.git_credentials || 'git-credentials' }}
+  REGISTRY_SECRET: ${{ github.event.inputs.registry_secret || 'acr-credentials' }}
+  AZURE_SECRET: ${{ github.event.inputs.azure_secret || 'azure-credentials' }}
+  APP_NAMESPACE: ${{ github.event.inputs.app_namespace || 'argo' }}
+  RESOURCE_GROUP: ${{ github.event.inputs.resourceGroup || 'sda-auto-devops-demo' }}
+
+jobs:
+  prepare:
+    name: Prepare Environment
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Configure Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+  lint:
+    name: Lint and Static Code Analysis
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: v1.57
+      - name: Run golangci-lint
+        run: golangci-lint run --timeout=5m
+
+  test:
+    name: Unit and Integration Tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Run Go tests
+        run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.txt
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  build:
+    name: Build Go and Docker Image
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    needs: [lint, test]
+    outputs:
+      image_tag: ${{ steps.docker_tag.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Build Go binary
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o app ./...
+
+      - name: Set Docker Image Tag
+        id: docker_tag
+        run: |
+          IMAGE_TAG=gh${GITHUB_SHA::7}
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ env.REGISTRY }}/go-docker:${{ steps.docker_tag.outputs.image_tag }} \
+            -t ${{ env.REGISTRY }}/go-docker:latest \
+            .
+
+  trivy-scan:
+    name: Vulnerability Scan with Trivy
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Trivy
+        uses: aquasecurity/trivy-action@v0.19.0
+        with:
+          skip-update: false
+      - name: Scan Go modules
+        run: trivy fs --exit-code 1 --severity HIGH,CRITICAL .
+      - name: Scan Docker Image
+        run: |
+          trivy image --exit-code 1 --severity HIGH,CRITICAL ${{ env.REGISTRY }}/go-docker:${{ needs.build.outputs.image_tag }}
+
+  push-image:
+    name: Push Image to Registry
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    needs: [build, trivy-scan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Push Docker image
+        run: |
+          docker push ${{ env.REGISTRY }}/go-docker:${{ needs.build.outputs.image_tag }}
+          docker push ${{ env.REGISTRY }}/go-docker:latest
+
+  iac-apply:
+    name: Terraform Apply (AKS & Infra)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    needs: push-image
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.5
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+  deploy:
+    name: Deploy to Azure AKS
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    needs: [push-image, iac-apply]
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up kubectl
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Create Namespace if not exists
+        run: kubectl create namespace ${{ env.APP_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create/update registry secret in AKS
+        run: |
+          kubectl -n ${{ env.APP_NAMESPACE }} create secret docker-registry ${{ env.REGISTRY_SECRET }} \
+            --docker-server=${{ env.REGISTRY }} \
+            --docker-username=${{ secrets.ACR_USERNAME }} \
+            --docker-password='${{ secrets.ACR_PASSWORD }}' \
+            --docker-email='${{ secrets.ACR_EMAIL }}' \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy App to AKS
+        run: |
+          helm upgrade --install go-docker ./deploy/helm \
+            --namespace ${{ env.APP_NAMESPACE }} \
+            --set image.repository=${{ env.REGISTRY }}/go-docker \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --set image.pullSecrets[0]=${{ env.REGISTRY_SECRET }}
+        env:
+          KUBECONFIG: ${{ secrets.KUBECONFIG }}
+
+  post-deploy-tests:
+    name: Post-Deployment Smoke Tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    needs: deploy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Smoke Tests
+        run: |
+          go test -v ./tests/smoke
+
+  monitoring-setup:
+    name: Monitoring & Logging Setup
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    needs: deploy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Prometheus, Grafana, ELK Stack via Ansible
+        uses: dawidd6/action-ansible-playbook@v2
+        with:
+          playbook: deploy/monitoring/setup.yml
+          options: |
+            -i deploy/monitoring/inventory
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: 'False'
+
+  code-scanning:
+    name: Code Scanning (CodeQL)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: go
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
+
+  compliance-check:
+    name: Azure Policy and Compliance Checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    needs: [iac-apply, deploy]
+    steps:
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Azure Policy Compliance Scan
+        run: |
+          az policy state summarize --resource-group ${{ env.RESOURCE_GROUP }}
+      - name: Export Azure Policy Compliance Report
+        run: |
+          az policy state list --resource-group ${{ env.RESOURCE_GROUP }} --query "[?complianceState=='NonCompliant']"
+
+  cleanup:
+    name: Cleanup Dangling Images
+    if: ${{ always() }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Remove dangling Docker images
+        run: |
+          docker system prune -f
