@@ -34,18 +34,41 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
           go-version: '1.21'
+
       - name: Download Dependencies
         run: go mod tidy
+
       - name: Run go vet
         run: go vet ./...
+
       - name: Run GolangCI-Lint
+        id: golangci-lint
         uses: golangci/golangci-lint-action@v4.0.0
         with:
           version: v1.56
+        continue-on-error: true
+
+      - name: Upload GolangCI-Lint Report
+        if: steps.golangci-lint.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: golangci-lint-report
+          path: |
+            ./report.json
+            ./golangci-lint.log
+          if-no-files-found: ignore
+
+      - name: Fail Pipeline On Lint Errors
+        if: steps.golangci-lint.outcome == 'failure'
+        run: |
+          echo "::error ::GolangCI-Lint found issues. Please review the report artifact for full details."
+          exit 1
+
       - name: Run Gosec
         uses: securego/gosec@v2.19.0
         with:
@@ -167,7 +190,7 @@ jobs:
             --namespace ${{ env.APP_NAMESPACE }}
       - name: Enforce AKS & Azure Policies
         run: |
-          # Placeholder for AKS/azure policy CLI commands if required
+          echo "Placeholder for AKS/azure policy CLI commands if required"
 
   post-deploy-test:
     name: Post-Deployment Validation Tests
@@ -203,7 +226,6 @@ jobs:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
       - name: Configure Azure Monitor & Prometheus
         run: |
-          # Placeholder for Azure Monitor and Prometheus setup
           echo "Monitoring is set up per Azure/Prometheus configs."
 
   codeql:
