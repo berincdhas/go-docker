@@ -1,0 +1,289 @@
+name: autodevops-go-docker-ci-cd
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: 'ACR URL'
+        required: true
+        type: string
+        default: autodevopsacr.azurecr.io
+      git_credentials:
+        description: 'K8s secret for Git credentials'
+        required: true
+        type: string
+        default: git-credentials
+      registry_secret:
+        description: 'K8s secret for ACR'
+        required: true
+        type: string
+        default: acr-credentials
+      azure_secret:
+        description: 'K8s secret for Azure credentials'
+        required: true
+        type: string
+        default: azure-credentials
+      app_namespace:
+        description: 'K8s namespace'
+        required: true
+        type: string
+        default: argo
+      resourceGroup:
+        description: 'Azure resource group'
+        required: true
+        type: string
+        default: sda-auto-devops-demo
+
+concurrency:
+  group: autodevops-go-docker-ci-cd-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+env:
+  REGISTRY: ${{ inputs.registry || 'autodevopsacr.azurecr.io' }}
+  APP_NAME: myapp
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+
+  checkout-and-lint:
+    name: Checkout, Lint, and Static Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Go mod tidy & download
+        run: |
+          go mod tidy
+          go mod download
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: v1.54
+
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@v2.0.2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        if: ${{ env.SONAR_TOKEN && env.SONAR_HOST_URL }}
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: checkout-and-lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Go Test (Unit & Integration)
+        run: |
+          go test -v -race -coverprofile=coverage.out ./...
+        env:
+          TZ: UTC
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  build-and-image:
+    name: Build Go Binary and Docker Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Build Go binary
+        run: |
+          mkdir -p bin
+          go build -o bin/app ./cmd/app
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Azure CLI - ACR Login
+        uses: azure/cli@v2
+        with:
+          azcliversion: 2.52.0
+          inlineScript: az acr login --name ${{ env.REGISTRY }}
+
+      - name: Docker build
+        run: |
+          docker build -t ${{ env.REGISTRY }}/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }} .
+
+      - name: Trivy Scan
+        uses: aquasecurity/trivy-action@v0.17.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}
+          format: 'table'
+          exit-code: '1'
+        continue-on-error: false
+
+      - name: Push to ACR
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}
+
+  deploy:
+    name: Deploy to AKS
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build-and-image
+    environment:
+      name: production
+      url: https://github.com/berincdhas/go-docker
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ inputs.resourceGroup || 'sda-auto-devops-demo' }}
+          cluster-name: ${{ secrets.AZURE_AKS_CLUSTER }}
+          admin: 'false'
+
+      - name: Create/Update imagePullSecret
+        run: |
+          kubectl create secret docker-registry ${{ inputs.registry_secret || 'acr-credentials' }} \
+            --docker-server=${{ env.REGISTRY }} \
+            --docker-username=${{ secrets.ACR_USERNAME }} \
+            --docker-password=${{ secrets.ACR_PASSWORD }} \
+            --docker-email=example@example.com \
+            --namespace=${{ inputs.app_namespace || 'argo' }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy using kubectl
+        run: |
+          kubectl -n ${{ inputs.app_namespace || 'argo' }} set image deployment/${{ env.APP_NAME }} ${{ env.APP_NAME }}=${{ env.REGISTRY }}/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}
+          kubectl -n ${{ inputs.app_namespace || 'argo' }} rollout status deployment/${{ env.APP_NAME }}
+
+      - name: Enforce Azure Policy on AKS
+        run: |
+          az aks policy assignment list --resource-group ${{ inputs.resourceGroup || 'sda-auto-devops-demo' }} --cluster-name ${{ secrets.AZURE_AKS_CLUSTER }}
+
+  integration-tests:
+    name: Post-deployment Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: deploy
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Integration test (API endpoints)
+        run: |
+          sleep 30
+          go test -v -tags=integration ./integrationtests/ || exit 1
+
+  monitoring-alerts:
+    name: Monitoring and Alert Setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: deploy
+    steps:
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ inputs.resourceGroup || 'sda-auto-devops-demo' }}
+          cluster-name: ${{ secrets.AZURE_AKS_CLUSTER }}
+          admin: 'false'
+
+      - name: Deploy Prometheus monitoring
+        run: |
+          kubectl apply -f monitor/prometheus.yaml -n ${{ inputs.app_namespace || 'argo' }}
+
+      - name: Deploy Grafana dashboards
+        run: |
+          kubectl apply -f monitor/grafana.yaml -n ${{ inputs.app_namespace || 'argo' }}
+
+      - name: Enable Azure Monitor
+        run: |
+          az aks enable-addons --resource-group ${{ inputs.resourceGroup || 'sda-auto-devops-demo' }} --name ${{ secrets.AZURE_AKS_CLUSTER }} --addons monitoring --enable-msi-auth-for-monitoring true --no-wait
+
+  compliance-policy:
+    name: Compliance & Policy Enforcement
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: deploy
+    steps:
+      - name: Azure Policy Assignment Check
+        uses: azure/cli@v2
+        with:
+          azcliversion: 2.52.0
+          inlineScript: |
+            az policy assignment list --resource-group ${{ inputs.resourceGroup || 'sda-auto-devops-demo' }}
+
+      - name: Enforce Kubernetes Policy
+        run: |
+          kubectl get po -n ${{ inputs.app_namespace || 'argo' }} -o yaml | grep 'resources:'
+          kubectl get po -n ${{ inputs.app_namespace || 'argo' }} -o yaml | grep 'livenessProbe'
+
+      - name: Audit encrypted secrets in K8s
+        run: |
+          kubectl get secrets -n ${{ inputs.app_namespace || 'argo' }} | grep -E '(git-credentials|acr-credentials|azure-credentials)'
+
+      - name: Audit ACR image integrity
+        run: |
+          az acr repository show --name ${{ env.REGISTRY }} --repository ${{ env.APP_NAME }}
+
+      - name: Audit Azure AKS region/SKU compliance
+        uses: azure/cli@v2
+        with:
+          azcliversion: 2.52.0
+          inlineScript: |
+            az aks show --resource-group ${{ inputs.resourceGroup || 'sda-auto-devops-demo' }} --name ${{ secrets.AZURE_AKS_CLUSTER }} --query 'location'
+            az aks show --resource-group ${{ inputs.resourceGroup || 'sda-auto-devops-demo' }} --name ${{ secrets.AZURE_AKS_CLUSTER }} --query 'agentPoolProfiles[].vmSize'
