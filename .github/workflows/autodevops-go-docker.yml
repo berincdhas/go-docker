@@ -1,0 +1,231 @@
+name: autodevops-go-docker
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: 'The container registry URL'
+        required: true
+        default: 'autodevopsacr.azurecr.io'
+      git_credentials:
+        description: 'Kubernetes secret name for Git credentials'
+        required: true
+        default: 'git-credentials'
+      registry_secret:
+        description: 'Kubernetes secret name for container registry auth'
+        required: true
+        default: 'acr-credentials'
+      azure_secret:
+        description: 'Kubernetes secret name for Azure credentials'
+        required: true
+        default: 'azure-credentials'
+      app_namespace:
+        description: 'Kubernetes namespace for deployment'
+        required: true
+        default: 'argo'
+      resourceGroup:
+        description: 'Azure resource group'
+        required: true
+        default: 'sda-auto-devops-demo'
+
+concurrency:
+  group: autodevops-go-docker-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+  checks: write
+  security-events: write
+  id-token: write
+
+env:
+  REGISTRY: ${{ github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}
+  GIT_CREDENTIALS: ${{ github.event.inputs.git_credentials || 'git-credentials' }}
+  REGISTRY_SECRET: ${{ github.event.inputs.registry_secret || 'acr-credentials' }}
+  AZURE_SECRET: ${{ github.event.inputs.azure_secret || 'azure-credentials' }}
+  APP_NAMESPACE: ${{ github.event.inputs.app_namespace || 'argo' }}
+  RESOURCE_GROUP: ${{ github.event.inputs.resourceGroup || 'sda-auto-devops-demo' }}
+  IMAGE_NAME: go-docker
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-test-scan:
+    name: Build, Test, Lint, and Scan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Install dependencies
+        run: |
+          go mod tidy
+          go mod verify
+
+      - name: Run gofmt
+        run: |
+          fmtout=$(gofmt -l .)
+          if [ -n "$fmtout" ]; then echo "$fmtout"; exit 1; fi
+
+      - name: Run golint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: v1.56.2
+          args: --enable=golint --timeout=3m
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run unit tests
+        run: go test -v ./...
+
+      - name: Build binary
+        run: go build -o app .
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build Docker image
+        run: |
+          docker build -t $REGISTRY/$IMAGE_NAME:$IMAGE_TAG .
+
+      - name: Scan filesystem for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@v0.17.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          vuln-type: os,library
+          exit-code: 1
+          severity: CRITICAL,HIGH
+
+      - name: Scan Docker image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@v0.17.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          vuln-type: os,library
+          exit-code: 1
+          severity: CRITICAL,HIGH
+
+      - name: Push Docker image to Azure Container Registry
+        run: |
+          docker push $REGISTRY/$IMAGE_NAME:$IMAGE_TAG
+
+  deploy:
+    name: Deploy to AKS
+    runs-on: ubuntu-22.04
+    needs: build-test-scan
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Azure CLI
+        uses: azure/cli@v2
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS Credentials
+        run: az aks get-credentials --resource-group "$RESOURCE_GROUP" --name "$APP_NAMESPACE" --overwrite-existing
+
+      - name: Create Kubernetes secrets (if not present)
+        run: |
+          kubectl get secret $REGISTRY_SECRET --namespace=$APP_NAMESPACE || \
+          kubectl create secret docker-registry $REGISTRY_SECRET \
+            --docker-server=$REGISTRY \
+            --docker-username=${{ secrets.ACR_USERNAME }} \
+            --docker-password=${{ secrets.ACR_PASSWORD }} \
+            --namespace=$APP_NAMESPACE
+
+      - name: Deploy application manifests
+        run: |
+          kubectl apply -n $APP_NAMESPACE -f k8s/
+
+      - name: Verify rollout
+        run: |
+          kubectl rollout status deployment/${IMAGE_NAME} -n $APP_NAMESPACE --timeout=120s
+
+      - name: Post-deployment smoke test
+        run: |
+          sleep 10
+          kubectl get pods -n $APP_NAMESPACE
+          POD=$(kubectl get pods -n $APP_NAMESPACE -l app=${IMAGE_NAME} -o jsonpath="{.items[0].metadata.name}")
+          kubectl exec -n $APP_NAMESPACE $POD -- curl -sf http://localhost:8080/health || exit 1
+
+  compliance-monitoring:
+    name: Compliance Reporting and Monitoring
+    runs-on: ubuntu-22.04
+    needs: deploy
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Compliance Policy Scan
+        run: |
+          az policy assignment list --resource-group "$RESOURCE_GROUP"
+          az policy state summarize --resource-group "$RESOURCE_GROUP"
+        continue-on-error: true
+
+      - name: Monitor Azure health events
+        run: |
+          az monitor activity-log list --resource-group "$RESOURCE_GROUP" --status "Active"
+
+  monitoring-logging:
+    name: Monitoring and Logging Checks
+    runs-on: ubuntu-22.04
+    needs: deploy
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Validate Prometheus and Grafana status
+        run: |
+          kubectl -n monitoring get pods
+          kubectl -n monitoring get svc
+        continue-on-error: true
+
+      - name: Validate Log Analytics workspace registration
+        run: |
+          az monitor log-analytics workspace list --resource-group "$RESOURCE_GROUP"
+        continue-on-error: true
