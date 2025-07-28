@@ -1,0 +1,328 @@
+name: AutodevOps Go-Docker CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: autodevops-go-docker-pipeline-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: autodevopsacr.azurecr.io
+  APP_NAMESPACE: argo
+  RESOURCE_GROUP: sda-auto-devops-demo
+  DOCKER_BUILDKIT: 1
+  GO_VERSION: '1.21'
+  IMAGE_NAME: go-docker
+  STAGING_ENV: staging
+  IMAGE_TAG: ${{ github.sha }}
+
+permissions:
+  contents: read
+  id-token: write
+  actions: read
+  packages: write
+
+jobs:
+  code-analysis-and-test:
+    name: Static Analysis, Lint, Test & Source Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Install dependencies
+        run: |
+          go mod tidy
+
+      - name: Run go vet
+        run: |
+          go vet ./...
+
+      - name: Run golint
+        uses: golangci/golangci-lint-action@v5
+        with:
+          version: v1.57
+
+      - name: Run tests with coverage
+        run: |
+          go test -v ./... -coverprofile=coverage.out
+
+      - name: Upload test results
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+      - name: Security scan (Trivy - source)
+        uses: aquasecurity/trivy-action@0.18.0
+        with:
+          scan-type: fs
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-source-results.sarif
+
+      - name: Upload Trivy scan results (source)
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-source-results
+          path: trivy-source-results.sarif
+
+  build-and-image-scan:
+    name: Build & Scan Container Image
+    needs: code-analysis-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IMAGE_FULL: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build Docker image
+        run: |
+          docker build -t $IMAGE_FULL .
+
+      - name: Scan Docker image (Trivy)
+        uses: aquasecurity/trivy-action@0.18.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: sarif
+          output: trivy-image-results.sarif
+          ignore-unfixed: true
+
+      - name: Upload Trivy scan results (image)
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-results
+          path: trivy-image-results.sarif
+
+      - name: Push image to ACR
+        run: |
+          docker push $IMAGE_FULL
+
+  iac-terraform-grc:
+    name: Terraform Format, Validate & Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform format check
+        run: terraform fmt -check
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        id: plan
+        run: terraform plan -out=tfplan
+
+      - name: Upload Terraform plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: tfplan
+
+  deploy-staging:
+    name: Deploy to Staging AKS
+    needs: [build-and-image-scan, iac-terraform-grc]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ env.STAGING_ENV }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Azure CLI
+        uses: azure/cli@v2
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.RESOURCE_GROUP }}-aks --overwrite-existing
+
+      - name: Set image in manifests
+        run: |
+          sed -i "s|image: .*$|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|" k8s/deployment.yaml
+
+      - name: Deploy using kubectl
+        run: |
+          kubectl apply -n ${{ env.APP_NAMESPACE }} -f k8s/
+
+      - name: Wait for deployment rollout
+        run: |
+          kubectl rollout status deployment/${{ env.IMAGE_NAME }} -n ${{ env.APP_NAMESPACE }} --timeout=180s
+
+  post-deployment-tests:
+    name: Post-Deployment Integration & Smoke Test
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Run smoke tests
+        run: |
+          go test -v ./test/smoke --tags=integration
+
+      - name: Run integration/E2E tests
+        run: |
+          go test -v ./test/integration --tags=e2e
+
+  compliance-enforcement:
+    name: Compliance & Policy Enforcement
+    needs: post-deployment-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify Azure Policies for AKS
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az policy assignment list --scope /subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }} | grep AKS
+
+      - name: Check resource locations & SKUs
+        run: |
+          az aks show --name ${{ env.RESOURCE_GROUP }}-aks --resource-group ${{ env.RESOURCE_GROUP }} | jq '.location'
+
+      - name: Enforce HIPAA training attestation
+        run: |
+          echo "Check HR systems for latest HIPAA training logs (manual or automated attestation required)."
+
+  production-deployment:
+    name: Deploy to Production (Gated)
+    needs: compliance-enforcement
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: https://go-docker-prod.company.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Await production deployment approval
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ secrets.GH_APPROVAL_TOKEN }}
+          approvers: berincdhas
+
+      - name: Set up Azure CLI
+        uses: azure/cli@v2
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.RESOURCE_GROUP }}-aks --overwrite-existing
+
+      - name: Set image in manifests
+        run: |
+          sed -i "s|image: .*$|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|" k8s/deployment.yaml
+
+      - name: Deploy using kubectl to production
+        run: |
+          kubectl apply -n ${{ env.APP_NAMESPACE }} -f k8s/
+
+      - name: Wait for production rollout
+        run: |
+          kubectl rollout status deployment/${{ env.IMAGE_NAME }} -n ${{ env.APP_NAMESPACE }} --timeout=180s
+
+  monitoring-setup:
+    name: Monitoring & Alerting Setup
+    needs: [deploy-staging, production-deployment]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Azure CLI
+        uses: azure/cli@v2
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Prometheus and Grafana via Helm
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack --namespace monitoring --create-namespace
+          helm upgrade --install grafana grafana/grafana --namespace monitoring --create-namespace
+
+      - name: Configure Azure Monitor integration
+        run: |
+          az monitor log-analytics workspace create --resource-group ${{ env.RESOURCE_GROUP }} --workspace-name aks-law --location westus2 --sku PerGB2018
+          az aks enable-addons --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.RESOURCE_GROUP }}-aks --addons monitoring --workspace-resource-id $(az monitor log-analytics workspace show --resource-group ${{ env.RESOURCE_GROUP }} --workspace-name aks-law --query id -o tsv)
+
+      - name: Configure monitoring/alerting policies
+        run: |
+          echo "Create Grafana dashboards, Prometheus alert rules and notifications as code (see /monitoring directory)."
