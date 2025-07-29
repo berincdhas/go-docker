@@ -78,7 +78,7 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
       - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@v0.19.0
+        uses: aquasecurity/trivy-action@v0.21.2
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           format: table
@@ -144,10 +144,9 @@ jobs:
           version: 'latest'
 
       - name: Trivy scan running workloads
-        uses: aquasecurity/trivy-action@v0.19.0
+        uses: aquasecurity/trivy-action@v0.21.2
         with:
           scan-type: k8s
-          # kubeconfig handled by azure/aks-set-context - default location
           namespace: default
           format: table
           exit-code: '1'
